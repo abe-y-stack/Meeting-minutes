@@ -639,8 +639,8 @@ async function decodeToMono16k(file) {
 }
 
 // ---------- 音声をセグメントに分割 ----------
-function sliceSegments(float32Audio) {
-  const segLen = SEGMENT_SECONDS * SAMPLE_RATE;
+function sliceSegments(float32Audio, seconds = SEGMENT_SECONDS) {
+  const segLen = seconds * SAMPLE_RATE;
   const segments = [];
   for (let start = 0; start < float32Audio.length; start += segLen) {
     segments.push(float32Audio.slice(start, Math.min(start + segLen, float32Audio.length)));
@@ -868,25 +868,16 @@ async function composeMinutes(notesText, meta) {
 
 // =========================================================
 // オンライン高速モード：Gemini API（要APIキー・要ネット接続）
-// 音声/動画ファイルをそのままGeminiに渡し、書き起こし＋議事録整形を1回のリクエストで行う
+// 音声が長いとTPM（1分あたりトークン数）の上限に達し空応答になるため、
+// 区間ごとに書き起こし → 最後に1回だけ整形、というオフライン版と同じ
+// map-reduce構成にしている（Files APIの上限やRPM対策も兼ねる）。
 // =========================================================
 
 const GEMINI_INLINE_LIMIT = 15 * 1024 * 1024; // 15MB以下はinlineData、それ以上はFiles API
+const GEMINI_AUDIO_SEGMENT_SECONDS = 45 * 60; // まず45分区切りで送り、上限に達したら自動で半分に分割する
+const GEMINI_MIN_CALL_INTERVAL_MS = 13000; // RPM上限対策（無料枠は5回/分程度のため約13秒間隔を確保）
 
-const ONLINE_SYSTEM = `あなたは日本語の会議の音声/動画から議事録を作成するアシスタントです。添付された音声を聞いて内容を書き起こし、次の2つのセクションだけで出力してください。他の文章は一切含めないでください。
-
-===TRANSCRIPT===
-（音声の書き起こし全文。話者や言い淀みは適宜整えてよいが、内容を創作しないこと）
-
-===MINUTES===
-◆ 話題名
-　要点を1〜3行で（各行の先頭に全角スペースを1つ入れる）
-【決定】決定事項の内容（ある場合のみ）
-☐ TODOの内容（担当者が分かれば末尾に「（担当者）」を付記）
-（話題ごとに◆で区切り、重複する内容はまとめる。雑談や意味不明な発言は無視する。すべての話題を書いたあと、最後に一度だけ全TODOをまとめて次の形式で再掲する。TODOが一つも無ければこのセクションごと省略）
-
-▼ 次回までのTODO
-☐ 内容　（担当者）`;
+const ONLINE_TRANSCRIBE_SYSTEM = `あなたは日本語の音声を書き起こすアシスタントです。添付された音声の内容をそのまま日本語で書き起こしてください。話者や言い淀みは適宜整えてよいですが、内容を創作しないでください。書き起こし文以外は一切出力しないでください（前置き・見出し・説明は不要）。`;
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -897,30 +888,29 @@ function fileToBase64(file) {
   });
 }
 
-async function geminiUploadFile(file, apiKey) {
+async function geminiUploadFile(blob, apiKey, displayName) {
   const startRes = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`, {
     method: 'POST',
     headers: {
       'X-Goog-Upload-Protocol': 'resumable',
       'X-Goog-Upload-Command': 'start',
-      'X-Goog-Upload-Header-Content-Length': String(file.size),
-      'X-Goog-Upload-Header-Content-Type': file.type || 'application/octet-stream',
+      'X-Goog-Upload-Header-Content-Length': String(blob.size),
+      'X-Goog-Upload-Header-Content-Type': blob.type || 'application/octet-stream',
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ file: { display_name: file.name } }),
+    body: JSON.stringify({ file: { display_name: displayName || 'audio' } }),
   });
   if (!startRes.ok) throw new Error(`Geminiへのアップロード開始に失敗しました (HTTP ${startRes.status})`);
   const uploadUrl = startRes.headers.get('X-Goog-Upload-URL');
   if (!uploadUrl) throw new Error('アップロードURLが取得できませんでした');
 
-  log('ファイルをGeminiにアップロード中…');
   const uploadRes = await fetch(uploadUrl, {
     method: 'POST',
     headers: {
       'X-Goog-Upload-Command': 'upload, finalize',
       'X-Goog-Upload-Offset': '0',
     },
-    body: file,
+    body: blob,
   });
   if (!uploadRes.ok) throw new Error(`アップロードに失敗しました (HTTP ${uploadRes.status})`);
   let info = (await uploadRes.json()).file;
@@ -937,10 +927,20 @@ async function geminiUploadFile(file, apiKey) {
   return info;
 }
 
-async function geminiGenerateContent(apiKey, model, parts) {
+async function geminiUploadOrInline(apiKey, blob, mime, displayName) {
+  if (blob.size <= GEMINI_INLINE_LIMIT) {
+    const base64 = await fileToBase64(blob);
+    return { inlineData: { mimeType: mime, data: base64 } };
+  }
+  log(`区間サイズ ${(blob.size / 1024 / 1024).toFixed(1)}MB のためFiles API経由でアップロードします`);
+  const info = await geminiUploadFile(blob, apiKey, displayName);
+  return { fileData: { fileUri: info.uri, mimeType: info.mimeType || mime } };
+}
+
+async function geminiGenerateContent(apiKey, model, parts, systemText) {
   const maxRetries = 3;
   const body = JSON.stringify({
-    systemInstruction: { parts: [{ text: ONLINE_SYSTEM }] },
+    systemInstruction: { parts: [{ text: systemText }] },
     contents: [{ role: 'user', parts }],
   });
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -962,32 +962,58 @@ async function geminiGenerateContent(apiKey, model, parts) {
       throw new Error(msg);
     }
     const cand = data && data.candidates && data.candidates[0];
+    const finishReason = cand && cand.finishReason;
     const text = cand && cand.content && cand.content.parts
       ? cand.content.parts.map(p => p.text || '').join('')
       : '';
-    if (!text) throw new Error('Gemini APIから空の応答が返されました（音声が長すぎる、または内容を認識できなかった可能性があります）');
+    if (!text) {
+      const hint = finishReason ? `（finishReason: ${finishReason}）` : '';
+      throw new Error(`Gemini APIから空の応答が返されました${hint}。無料枠のトークン上限(TPM)に達している可能性があります。`);
+    }
     return text;
   }
   throw new Error('Geminiの混雑が続いているため処理できませんでした。しばらく待ってから再度お試しください。');
 }
 
-function splitOnlineResult(text) {
-  const tIdx = text.indexOf('===TRANSCRIPT===');
-  const mIdx = text.indexOf('===MINUTES===');
-  if (tIdx === -1 || mIdx === -1) return { transcript: '', minutes: text };
-  return {
-    transcript: text.slice(tIdx + '===TRANSCRIPT==='.length, mIdx).trim(),
-    minutes: text.slice(mIdx + '===MINUTES==='.length).trim(),
-  };
+async function geminiWaitForRateLimit(state_) {
+  if (state_.lastCallTime) {
+    const wait = GEMINI_MIN_CALL_INTERVAL_MS - (Date.now() - state_.lastCallTime);
+    if (wait > 0) {
+      log(`APIの利用間隔を確保するため${Math.round(wait / 1000)}秒待機します…`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  state_.lastCallTime = Date.now();
 }
 
-async function extractAudioOnlyForUpload(file) {
-  setStage('音声トラックを抽出中…（動画から音声だけを取り出してアップロードを軽くします）');
-  log('動画から音声のみを抽出中…');
-  const { audio } = await decodeToMono16k(file);
-  const blob = encodeWav16(audio, SAMPLE_RATE);
-  log(`音声抽出完了（${(blob.size / 1024 / 1024).toFixed(1)}MB、元は${(file.size / 1024 / 1024).toFixed(1)}MB）`, 'ok2');
-  return blob;
+// TPM上限に引っかかって空応答になった場合、その区間だけ半分に割って再試行する。
+// 最初から小さく刻むより、当たった時だけ分割する方がリクエスト数を節約できる。
+async function transcribeSegmentAdaptive(apiKey, model, floatAudio, label, rateState, depth = 0) {
+  const durationSec = floatAudio.length / SAMPLE_RATE;
+  await geminiWaitForRateLimit(rateState);
+  setStage(`Geminiで書き起こし中…（${label}・約${fmtDuration(durationSec)}）`);
+  log(`Geminiに書き起こしをリクエスト中…（${label}・約${fmtDuration(durationSec)}、モデル: ${model}）`);
+  const wavBlob = encodeWav16(floatAudio, SAMPLE_RATE);
+  const part = await geminiUploadOrInline(apiKey, wavBlob, 'audio/wav', `${label}.wav`);
+  try {
+    const text = await geminiGenerateContent(apiKey, model, [
+      { text: `添付の音声（約${fmtDuration(durationSec)}）を日本語で書き起こしてください。` },
+      part,
+    ], ONLINE_TRANSCRIBE_SYSTEM);
+    return text.trim();
+  } catch (e) {
+    const msg = e.message || '';
+    const looksLikeTokenLimit = /トークン上限|TPM|空の応答/i.test(msg);
+    const canSplit = depth < 3 && floatAudio.length > SAMPLE_RATE * 90; // 最短90秒までは分割可
+    if (looksLikeTokenLimit && canSplit) {
+      log(`「${label}」が上限に引っかかったため半分に分割して再試行します`, 'err');
+      const mid = Math.floor(floatAudio.length / 2);
+      const t1 = await transcribeSegmentAdaptive(apiKey, model, floatAudio.slice(0, mid), `${label}-a`, rateState, depth + 1);
+      const t2 = await transcribeSegmentAdaptive(apiKey, model, floatAudio.slice(mid), `${label}-b`, rateState, depth + 1);
+      return t1 + '\n' + t2;
+    }
+    throw e;
+  }
 }
 
 async function runOnlineMode(file, meta) {
@@ -996,41 +1022,34 @@ async function runOnlineMode(file, meta) {
   if (!apiKey) throw new Error('Gemini APIキーを入力してください');
   saveGeminiKey(apiKey);
 
-  // 動画ファイルは音声トラックだけ抽出してから送る（丸ごと送ると
-  // 「Request contains an invalid argument」等で失敗しやすく、映像分のトークンも無駄になるため）
-  let uploadFile = file;
-  let mime = file.type || 'audio/wav';
-  if (file.type && file.type.startsWith('video/')) {
-    uploadFile = await extractAudioOnlyForUpload(file);
-    mime = 'audio/wav';
+  setStage('音声を読み込み中…');
+  log(`ファイル読み込み: ${file.name}`);
+  const { audio, duration } = await decodeToMono16k(file);
+  setProgress(0.15);
+
+  const segments = sliceSegments(audio, GEMINI_AUDIO_SEGMENT_SECONDS);
+  log(`音声を${segments.length}区間に分割しました（1区間最大${Math.round(GEMINI_AUDIO_SEGMENT_SECONDS / 60)}分。上限に達した区間だけ自動で分割します）`);
+
+  const rateState = { lastCallTime: 0 };
+  const transcriptParts = [];
+  for (let i = 0; i < segments.length; i++) {
+    const text = await transcribeSegmentAdaptive(apiKey, model, segments[i], `${i + 1}/${segments.length}区間`, rateState);
+    transcriptParts.push(text);
+    setProgress(0.15 + 0.55 * ((i + 1) / segments.length));
   }
+  const transcript = transcriptParts.join('\n');
+  log('全区間の書き起こし完了', 'ok2');
 
-  let part;
-  if (uploadFile.size <= GEMINI_INLINE_LIMIT) {
-    setStage('音声データを準備中…');
-    const base64 = await fileToBase64(uploadFile);
-    part = { inlineData: { mimeType: mime, data: base64 } };
-  } else {
-    setStage('Geminiにファイルをアップロード中…（サイズが大きいため時間がかかる場合があります）');
-    log(`ファイルサイズ ${(uploadFile.size / 1024 / 1024).toFixed(1)}MB のためFiles API経由でアップロードします`);
-    const info = await geminiUploadFile(uploadFile, apiKey);
-    part = { fileData: { fileUri: info.uri, mimeType: info.mimeType || mime } };
-  }
-  setProgress(0.4);
-  setStage(`Gemini(${model})が音声を解析中…（数十秒〜数分かかります）`);
-  log(`Geminiに議事録作成をリクエスト中…（モデル: ${model}）`);
+  await geminiWaitForRateLimit(rateState);
+  setStage('Geminiで議事録に整形中…');
+  log('Geminiに議事録整形をリクエスト中…');
+  const minutesRaw = await geminiGenerateContent(apiKey, model, [{ text: transcript }], COMPOSE_SYSTEM);
+  setProgress(0.95);
+  log('議事録整形が完了しました', 'ok2');
 
-  const raw = await geminiGenerateContent(apiKey, model, [
-    { text: '添付の音声/動画は会議の録音です。指示された形式で書き起こしと議事録を作成してください。' },
-    part,
-  ]);
-  setProgress(0.9);
-  log('Geminiからの応答を受信しました', 'ok2');
-
-  const { transcript, minutes } = splitOnlineResult(raw);
   return {
-    transcript: transcript || '(取得できませんでした)',
-    minutes: buildHeader(meta) + (minutes || raw).trim(),
+    transcript,
+    minutes: buildHeader(meta) + minutesRaw.trim(),
   };
 }
 
