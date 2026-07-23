@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>議事録メーカー（Whisper + Gemini Nano / API不要）</title>
+<style>
+  /* =========================================================
+     Apple風モノクロ基調。アクセントカラーは議事録ひな形の機能色のみ:
+       赤 = 決定事項 / 薄ブルー = TODO
+     （リアルタイム議事録ツールと同じトークンに揃えています）
+     ========================================================= */
+  :root {
+    --ink: #1d1d1f;
+    --sub: #86868b;
+    --line: #e5e5e7;
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --red: #ff0000;       /* 決定事項 */
+    --blue-bg: #d9e8fb;   /* TODO */
+    --danger: #b00020;
+    --ok: #34c759;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif;
+    background: var(--bg); color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    padding-bottom: 60px;
+  }
+
+  header {
+    background: var(--card); border-bottom: 1px solid var(--line);
+    padding: 14px 18px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; font-weight: 700; letter-spacing: .02em; }
+  .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-left: auto; }
+  .badge {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--sub); background: var(--card);
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: #c7c7cc; }
+  .badge.ok { color: var(--ink); }
+  .badge.ok .dot { background: var(--ok); }
+  .badge.bad .dot { background: #c7c7cc; }
+
+  main { max-width: 720px; margin: 0 auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 16px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    padding: 18px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .card h2 { font-size: 14px; font-weight: 700; color: var(--sub); letter-spacing: .03em; }
+
+  .drop {
+    border: 1.5px dashed var(--line); border-radius: 14px; padding: 28px 16px;
+    text-align: center; color: var(--sub); cursor: pointer; transition: all .15s ease;
+  }
+  .drop:hover, .drop.drag { border-color: var(--ink); color: var(--ink); background: #fafafa; }
+  .drop input { display: none; }
+  .fileinfo { font-size: 13px; color: var(--ink); }
+  .fileinfo b { font-weight: 600; }
+
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .field { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 140px; }
+  .field label { font-size: 12px; color: var(--sub); }
+  .field input, .field select {
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; font-size: 14px;
+    background: var(--bg); color: var(--ink); font-family: inherit;
+  }
+
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button {
+    flex: 1; border: none; background: var(--card); color: var(--sub); padding: 9px 12px;
+    font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .seg button.active { background: var(--ink); color: #fff; }
+
+  .btn {
+    border: none; border-radius: 999px; padding: 11px 24px;
+    font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit;
+  }
+  .btn.primary { background: var(--ink); color: #fff; }
+  .btn.primary:disabled { background: #c7c7cc; cursor: not-allowed; }
+  .btn.ghost { background: var(--bg); color: var(--ink); border: 1px solid var(--line); }
+  .btn.ghost:hover { background: #eee; }
+
+  .progress-wrap { display: none; flex-direction: column; gap: 8px; }
+  .progress-wrap.show { display: flex; }
+  .bar { height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  .bar > div { height: 100%; width: 0%; background: var(--ink); transition: width .2s ease; }
+  .stage { font-size: 13px; color: var(--sub); }
+
+  .log {
+    background: #1d1d1f; color: #d1d1d6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; line-height: 1.6; border-radius: 12px; padding: 12px 14px;
+    max-height: 160px; overflow-y: auto; display: none;
+  }
+  .log.show { display: block; }
+  .log .err { color: #ff6961; }
+  .log .ok2 { color: #7ee787; }
+
+  .result { display: none; flex-direction: column; gap: 12px; }
+  .result.show { display: flex; }
+  .result-body {
+    border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
+    font-size: 14px; line-height: 1.8; min-height: 120px; outline: none;
+  }
+  .result-body .doc-title { font-size: 18px; font-weight: 800; margin-bottom: 2px; }
+  .result-body .meta-line { color: var(--sub); font-size: 13px; margin: 1px 0; }
+  .result-body .section-label {
+    font-size: 13px; font-weight: 700; color: var(--sub); letter-spacing: .03em;
+    margin: 16px 0 4px;
+  }
+  .result-body .bullet { margin: 2px 0 2px 8px; }
+  .result-body .ongoing { color: var(--sub); font-style: italic; margin: 4px 0; }
+  .result-body .comment {
+    border-left: 3px solid var(--ink); padding-left: 10px; margin: 8px 0;
+    font-style: italic; color: var(--ink);
+  }
+
+  @media print {
+    body * { visibility: hidden; }
+    #resultCard, #resultCard * { visibility: visible; }
+    #resultCard { position: absolute; left: 0; top: 0; width: 100%; border: none; }
+    #resultCard .row, #resultCard details.raw { display: none !important; }
+  }
+  .result-body .topic {
+    font-size: 14px; font-weight: 700; margin: 14px 0 6px; padding-bottom: 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  .result-body .topic:first-child { margin-top: 0; }
+  .result-body .decision { color: var(--red); font-weight: 600; margin: 4px 0; }
+  .result-body .todo {
+    display: inline-block; background: var(--blue-bg); padding: 3px 10px;
+    border-radius: 6px; margin: 4px 0; font-weight: 500;
+  }
+  .result-body p { margin: 4px 0; }
+
+  details.raw { font-size: 13px; color: var(--sub); }
+  details.raw summary { cursor: pointer; padding: 6px 0; }
+  details.raw pre {
+    white-space: pre-wrap; word-break: break-word; background: var(--bg);
+    border-radius: 10px; padding: 12px; margin-top: 8px; font-size: 12.5px; line-height: 1.7;
+    font-family: -apple-system, sans-serif; color: var(--ink);
+  }
+
+  .note { font-size: 12px; color: var(--sub); line-height: 1.6; }
+  .note a { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>議事録メーカー</h1>
+  <div class="badges">
+    <span class="badge" id="badgeGpu"><span class="dot"></span>WebGPU確認中…</span>
+    <span class="badge" id="badgeNano"><span class="dot"></span>Gemini Nano確認中…</span>
+  </div>
+</header>
+
+<main>
+
+  <div class="card">
+    <h2>0. 処理モード</h2>
+    <div class="seg" id="modeSeg">
+      <button data-m="offline" class="active">オフライン（完全ローカル・API不要）</button>
+      <button data-m="online">オンライン高速（Gemini API使用）</button>
+    </div>
+    <div class="note" id="modeNote" style="margin-top:-4px">端末内のWhisper＋Gemini Nanoで処理します（初回のみモデルダウンロードでネット接続が必要、音声データ自体は送信されません）。</div>
+  </div>
+
+  <div class="card">
+    <h2>1. 音声・動画ファイル</h2>
+    <div class="drop" id="drop">
+      <div id="dropText">クリックまたはドラッグ&ドロップでファイルを選択<br><span style="font-size:12px">mp3 / wav / m4a / mp4 など</span></div>
+      <input type="file" id="fileInput" accept="audio/*,video/*">
+    </div>
+    <div class="fileinfo" id="fileInfo"></div>
+  </div>
+
+  <div class="card">
+    <h2>2. 会議情報（任意・議事録の見出しに使います）</h2>
+    <div class="row">
+      <div class="field">
+        <label>会議名</label>
+        <input type="text" id="metaTitle" placeholder="例：〇〇工務店 定例打合せ">
+      </div>
+      <div class="field">
+        <label>日時</label>
+        <input type="datetime-local" id="metaDate">
+      </div>
+    </div>
+    <div class="field">
+      <label>参加者（カンマ区切り）</label>
+      <input type="text" id="metaMembers" placeholder="例：安部, 荒木部長, 臼井">
+    </div>
+    <div class="field">
+      <label>固定議題（任意・1行1項目。空欄なら省略されます）</label>
+      <textarea id="metaFixedAgenda" rows="3" placeholder="例：&#10;前回振り返り&#10;改善項目確認&#10;定量定性進捗確認" style="border:1px solid var(--line); border-radius:10px; padding:9px 10px; font-size:14px; background:var(--bg); color:var(--ink); font-family:inherit; resize:vertical"></textarea>
+    </div>
+  </div>
+
+  <div class="card" id="geminiCard" style="display:none">
+    <h2>3. Gemini API設定</h2>
+    <div class="row">
+      <div class="field">
+        <label>APIキー</label>
+        <input type="password" id="geminiKey" placeholder="AIzaSy…">
+      </div>
+      <div class="field" style="flex:0 0 auto; min-width:0">
+        <label>&nbsp;</label>
+        <label style="font-size:12px; display:flex; align-items:center; gap:4px; padding:9px 0">
+          <input type="checkbox" id="geminiKeyShow" style="width:auto"> 表示
+        </label>
+      </div>
+    </div>
+    <div class="field">
+      <label>モデル名（通常は変更不要）</label>
+      <input type="text" id="geminiModel" value="gemini-3.5-flash">
+    </div>
+    <div class="note">APIキーはこの端末のブラウザ内にのみ保存され、Googleへのリクエスト以外には送信されません。音声・動画データはGoogleのサーバーに送信されて処理されます。無料枠を超えると課金される場合があるため、<a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener">料金体系</a>を確認してください。</div>
+  </div>
+
+  <div class="card" id="qualityCard">
+    <h2>4. 文字起こしモデル（オフライン用）</h2>
+    <div class="seg" id="qualitySeg">
+      <button data-q="tiny">超軽量（最速・目安40MB）</button>
+      <button data-q="base" class="active">軽量（速い・目安80MB）</button>
+      <button data-q="small">高精度（遅い・目安250MB）</button>
+    </div>
+    <div class="note" style="margin-top:-4px">長い会議録音は「超軽量」か「軽量」を推奨します。「高精度」は精度重視の短い音声向けです。</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="btn primary" id="startBtn" disabled>議事録を作成する</button>
+      <button class="btn ghost" id="resetBtn">やり直す</button>
+    </div>
+  </div>
+
+  <div class="card progress-wrap" id="progressCard">
+    <h2>処理状況</h2>
+    <div class="stage" id="stageText">待機中</div>
+    <div class="bar"><div id="barFill"></div></div>
+    <div class="log" id="logBox"></div>
+    <div class="row" id="skipRow" style="display:none">
+      <button class="btn ghost" id="skipBtn">議事録整形を中断して文字起こし結果だけ表示</button>
+    </div>
+  </div>
+
+  <div class="card result" id="resultCard">
+    <h2>議事録</h2>
+    <div class="row">
+      <button class="btn ghost" id="copyBtn">コピー（書式付き）</button>
+      <button class="btn ghost" id="downloadBtn">テキストで保存</button>
+      <button class="btn ghost" id="wordBtn">Wordで保存</button>
+      <button class="btn ghost" id="pdfBtn">PDFで保存</button>
+      <button class="btn ghost" id="addCommentBtn">＋ コメントを追加</button>
+    </div>
+    <div class="result-body" id="resultBody" contenteditable="true"></div>
+    <details class="raw">
+      <summary>文字起こし全文を見る</summary>
+      <pre id="rawTranscript"></pre>
+    </details>
+  </div>
+
+  <p class="note" id="footNote"></p>
+
+</main>
+
+<script type="module">
+// =========================================================
+// 議事録メーカー：Whisper(transformers.js) + Chrome内蔵Gemini Nano
+// どちらも端末内で完結。APIキー・サーバー送信は一切なし。
+// =========================================================
+
+const SAMPLE_RATE = 16000;
+const SEGMENT_SECONDS = 120; // 文字起こしを2分ごとに区切って進捗表示・メモリ節約・ETA計算用
+const NOTE_CHUNK_CHARS = 1200; // Gemini Nanoに渡す文字起こしの分割サイズ（文脈窓対策）
+
+const els = {
+  modeSeg: document.getElementById('modeSeg'),
+  modeNote: document.getElementById('modeNote'),
+  geminiCard: document.getElementById('geminiCard'),
+  geminiKey: document.getElementById('geminiKey'),
+  geminiKeyShow: document.getElementById('geminiKeyShow'),
+  geminiModel: document.getElementById('geminiModel'),
+  qualityCard: document.getElementById('qualityCard'),
+  drop: document.getElementById('drop'),
+  dropText: document.getElementById('dropText'),
+  fileInput: document.getElementById('fileInput'),
+  fileInfo: document.getElementById('fileInfo'),
+  metaTitle: document.getElementById('metaTitle'),
+  metaDate: document.getElementById('metaDate'),
+  metaMembers: document.getElementById('metaMembers'),
+  metaFixedAgenda: document.getElementById('metaFixedAgenda'),
+  qualitySeg: document.getElementById('qualitySeg'),
+  startBtn: document.getElementById('startBtn'),
+  resetBtn: document.getElementById('resetBtn'),
+  progressCard: document.getElementById('progressCard'),
+  skipRow: document.getElementById('skipRow'),
+  skipBtn: document.getElementById('skipBtn'),
+  stageText: document.getElementById('stageText'),
+  barFill: document.getElementById('barFill'),
+  logBox: document.getElementById('logBox'),
+  resultCard: document.getElementById('resultCard'),
+  resultBody: document.getElementById('resultBody'),
+  rawTranscript: document.getElementById('rawTranscript'),
+  copyBtn: document.getElementById('copyBtn'),
+  downloadBtn: document.getElementById('downloadBtn'),
+  wordBtn: document.getElementById('wordBtn'),
+  pdfBtn: document.getElementById('pdfBtn'),
+  addCommentBtn: document.getElementById('addCommentBtn'),
+  badgeGpu: document.getElementById('badgeGpu'),
+  badgeNano: document.getElementById('badgeNano'),
+  footNote: document.getElementById('footNote'),
+};
+
+let state = {
+  file: null,
+  quality: 'base',
+  mode: 'offline',
+  hasWebGPU: false,
+  hasNano: false,
+  skipRequested: false,
+  currentAbort: null,
+};
+
+// ---------- Gemini APIキーの保存（この端末のブラウザのみ。GitHub Pages等に配置した場合に有効） ----------
+function saveGeminiKey(key) {
+  try { localStorage.setItem('gemini_api_key_meeting_minutes', key); } catch (e) { /* Claude.aiのプレビュー等では保存できない場合があります */ }
+}
+function loadGeminiKey() {
+  try { return localStorage.getItem('gemini_api_key_meeting_minutes') || ''; } catch (e) { return ''; }
+}
+
+
+// ---------- ユーティリティ ----------
+function log(msg, cls) {
+  els.logBox.classList.add('show');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  const t = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  line.textContent = `[${t}] ${msg}`;
+  els.logBox.appendChild(line);
+  els.logBox.scrollTop = els.logBox.scrollHeight;
+}
+function setStage(text) { els.stageText.textContent = text; }
+function setProgress(ratio) { els.barFill.style.width = `${Math.max(0, Math.min(1, ratio)) * 100}%`; }
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function fmtDuration(sec) {
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${m}:${String(s).padStart(2,'0')}`;
+}
+function weekdayJa(d) { return ['日','月','火','水','木','金','土'][d.getDay()]; }
+function fmtMetaDate(dtLocalValue) {
+  if (!dtLocalValue) return '';
+  const d = new Date(dtLocalValue);
+  if (isNaN(d)) return '';
+  return `${d.getFullYear()}年${d.getMonth()+1}月${d.getDate()}日（${weekdayJa(d)}） ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}〜`;
+}
+
+// タイトル・日時・参加者・固定議題・「提案議題」ラベルは、AIに書かせず
+// ここで決定的に組み立てる（過去のGASツールのひな形に合わせた構成）
+function buildHeader(meta) {
+  const lines = [];
+  if (meta.title) lines.push(`# ${meta.title}`);
+  if (meta.dateText) lines.push(`日時：${meta.dateText}`);
+  if (meta.members) lines.push(`参加者：${meta.members}`);
+  lines.push('');
+  if (meta.fixedAgenda && meta.fixedAgenda.length) {
+    lines.push('『固定議題』');
+    meta.fixedAgenda.forEach(item => lines.push('・' + item));
+    lines.push('');
+  }
+  lines.push('『提案議題』');
+  lines.push('');
+  return lines.join('\n');
+}
+function getFixedAgendaItems() {
+  return els.metaFixedAgenda.value.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+// ---------- 起動時：対応状況チェック ----------
+async function checkCapabilities() {
+  // WebGPU
+  state.hasWebGPU = !!navigator.gpu;
+  els.badgeGpu.classList.add(state.hasWebGPU ? 'ok' : 'bad');
+  els.badgeGpu.innerHTML = `<span class="dot"></span>WebGPU: ${state.hasWebGPU ? '利用可' : '利用不可（wasmで動作）'}`;
+
+  // Gemini Nano (Chrome Prompt API)
+  if ('LanguageModel' in self) {
+    try {
+      const avail = await LanguageModel.availability();
+      state.hasNano = avail !== 'unavailable';
+      els.badgeNano.classList.add(state.hasNano ? 'ok' : 'bad');
+      els.badgeNano.innerHTML = `<span class="dot"></span>Gemini Nano: ${state.hasNano ? (avail === 'available' ? '利用可' : '初回DL要') : '利用不可'}`;
+    } catch (e) {
+      state.hasNano = false;
+      els.badgeNano.innerHTML = `<span class="dot"></span>Gemini Nano: 利用不可`;
+    }
+  } else {
+    state.hasNano = false;
+    els.badgeNano.classList.add('bad');
+    els.badgeNano.innerHTML = `<span class="dot"></span>Gemini Nano: 未対応のChrome`;
+  }
+
+  els.footNote.innerHTML = state.hasNano
+    ? 'Chrome 148以降の内蔵AI（Gemini Nano）で議事録を整形します。文字起こし・整形とも端末内で完結し、外部送信はありません。'
+    : 'Gemini Nanoが利用できないため、議事録の自動整形はスキップされ、文字起こし結果のみ出力されます。Chrome 148以降で chrome://flags/#prompt-api-for-gemini-nano を有効にすると整形機能が使えます。';
+}
+checkCapabilities();
+
+// ---------- ファイル選択 ----------
+els.drop.addEventListener('click', () => els.fileInput.click());
+els.drop.addEventListener('dragover', e => { e.preventDefault(); els.drop.classList.add('drag'); });
+els.drop.addEventListener('dragleave', () => els.drop.classList.remove('drag'));
+els.drop.addEventListener('drop', e => {
+  e.preventDefault(); els.drop.classList.remove('drag');
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+els.fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+
+function handleFile(file) {
+  state.file = file;
+  const mb = (file.size / (1024*1024)).toFixed(1);
+  els.dropText.innerHTML = `<b>${escapeHtml(file.name)}</b> を選択中`;
+  els.fileInfo.innerHTML = `<b>${escapeHtml(file.name)}</b>（${mb}MB）を選択しました。`;
+  els.startBtn.disabled = false;
+  if (!els.metaDate.value) {
+    const now = new Date();
+    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+    els.metaDate.value = now.toISOString().slice(0,16);
+  }
+}
+
+// ---------- モデル品質選択 ----------
+els.qualitySeg.querySelectorAll('button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    els.qualitySeg.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.quality = btn.dataset.q;
+  });
+});
+
+// ---------- 処理モード選択（オフライン / オンライン） ----------
+els.modeSeg.querySelectorAll('button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    els.modeSeg.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.mode = btn.dataset.m;
+    const online = state.mode === 'online';
+    els.geminiCard.style.display = online ? 'flex' : 'none';
+    els.qualityCard.style.display = online ? 'none' : 'flex';
+    els.modeNote.textContent = online
+      ? '音声・動画データがGoogleのGemini APIに送信され、クラウドで処理されます。要インターネット接続・要APIキー。'
+      : '端末内のWhisper＋Gemini Nanoで処理します（初回のみモデルダウンロードでネット接続が必要、音声データ自体は送信されません）。';
+  });
+});
+els.geminiKey.value = loadGeminiKey();
+els.geminiKeyShow.addEventListener('change', () => {
+  els.geminiKey.type = els.geminiKeyShow.checked ? 'text' : 'password';
+});
+
+// ---------- リセット ----------
+els.resetBtn.addEventListener('click', () => location.reload());
+
+
+// =========================================================
+// ffmpeg.wasm（単一スレッド版）でファイルから音声を抽出する
+// Chromeのdecoded Audioデータ(Web Audio API)はコンテナ/コーデックによって
+// 失敗することがあるため、より対応範囲の広いffmpegで代替する。
+// 単一スレッド版はSharedArrayBuffer不要のため、GitHub Pagesでもそのまま動く。
+// =========================================================
+let ffmpegInstance = null;
+async function getFFmpeg() {
+  if (ffmpegInstance) return ffmpegInstance;
+  setStage('音声処理エンジン(ffmpeg.wasm)を読み込み中…（初回のみ・数十MB）');
+  log('ffmpeg.wasmを読み込み中…');
+  const { FFmpeg } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm');
+  const { toBlobURL } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm');
+  const ffmpeg = new FFmpeg();
+  ffmpeg.on('log', ({ message }) => { /* console.debug('[ffmpeg]', message); */ });
+  const coreBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+  const ffmpegBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm';
+  try {
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${coreBaseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${coreBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      // Workerスクリプト自体もBlob化しないと、file://で開いた場合など
+      // オリジンが'null'になる環境でWorker生成に失敗する（既知の問題）
+      classWorkerURL: await toBlobURL(`${ffmpegBaseURL}/worker.js`, 'text/javascript'),
+    });
+  } catch (e) {
+    throw new Error('ffmpeg.wasmの読み込みに失敗しました。GitHub Pagesなどhttp(s)で配信された状態で開いているか確認してください（ファイルをローカルで直接開くと失敗する場合があります）: ' + (e.message || e));
+  }
+  log('ffmpeg.wasmの読み込み完了', 'ok2');
+  ffmpegInstance = ffmpeg;
+  return ffmpeg;
+}
+async function fetchFileUtil(file) {
+  const { fetchFile } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm');
+  return fetchFile(file);
+}
+function safeFsName(name) {
+  return 'in_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+// ---------- 音声デコード＆16kHzモノラル化（ffmpeg.wasm経由・オフライン用） ----------
+async function decodeToMono16k(file) {
+  const ffmpeg = await getFFmpeg();
+  const inputName = safeFsName(file.name);
+  await ffmpeg.writeFile(inputName, await fetchFileUtil(file));
+  setStage('音声を抽出・変換中…');
+  log('音声トラックを16kHzモノラルPCMに変換中…');
+  try {
+    await ffmpeg.exec(['-i', inputName, '-vn', '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 'f32le', '-acodec', 'pcm_f32le', 'out.pcm']);
+  } catch (e) {
+    throw new Error('音声の抽出に失敗しました（ファイル形式が非対応の可能性があります）: ' + (e.message || e));
+  }
+  const bytes = await ffmpeg.readFile('out.pcm');
+  const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const audio = new Float32Array(buf);
+  ffmpeg.deleteFile(inputName).catch(() => {});
+  ffmpeg.deleteFile('out.pcm').catch(() => {});
+  const duration = audio.length / SAMPLE_RATE;
+  log(`音声抽出完了（長さ: ${fmtDuration(duration)}）`, 'ok2');
+  return { audio, duration };
+}
+
+// ---------- 音声をセグメントに分割 ----------
+function sliceSegments(float32Audio) {
+  const segLen = SEGMENT_SECONDS * SAMPLE_RATE;
+  const segments = [];
+  for (let start = 0; start < float32Audio.length; start += segLen) {
+    segments.push(float32Audio.slice(start, Math.min(start + segLen, float32Audio.length)));
+  }
+  return segments.length ? segments : [float32Audio];
+}
+
+// ---------- Whisperパイプライン読み込み ----------
+const MODEL_MAP = {
+  tiny: 'onnx-community/whisper-tiny',
+  base: 'onnx-community/whisper-base',
+  small: 'onnx-community/whisper-small',
+};
+
+async function loadWhisperPipeline(quality) {
+  const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3');
+  const modelId = MODEL_MAP[quality] || MODEL_MAP.base;
+  const device = state.hasWebGPU ? 'webgpu' : 'wasm';
+  const dtype = state.hasWebGPU ? 'fp16' : 'q8';
+  log(`モデル読み込み開始: ${modelId} (${device})`);
+  const pipe = await pipeline('automatic-speech-recognition', modelId, {
+    device, dtype,
+    progress_callback: (p) => {
+      if (p.status === 'progress' && p.file) {
+        setStage(`モデルダウンロード中: ${p.file}（${Math.round(p.progress || 0)}%）`);
+      }
+    },
+  });
+  log('モデル読み込み完了', 'ok2');
+  return pipe;
+}
+
+// ---------- 文字起こし実行 ----------
+// ---------- 無音区間の簡易検出（暴走の主因になりやすいため事前にスキップ） ----------
+function rmsEnergy(arr) {
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) sum += arr[i] * arr[i];
+  return Math.sqrt(sum / arr.length);
+}
+const SILENCE_RMS_THRESHOLD = 0.006;
+
+// ---------- Whisperが同じ文字/単語を暴走して繰り返した場合の後処理 ----------
+function collapseRepetition(text) {
+  let out = text.replace(/(.)\1{5,}/gsu, '$1$1$1'); // 同一文字6連続以上 → 3回に短縮
+  const tokens = out.split(/(、|,|。|\s+)/);
+  const result = [];
+  let repeatCount = 0;
+  let lastToken = null;
+  for (const tok of tokens) {
+    const norm = tok.trim();
+    if (norm && norm === lastToken) {
+      repeatCount++;
+      if (repeatCount >= 4) continue; // 同一トークンが4回目以降は捨てる
+    } else {
+      repeatCount = 0;
+      lastToken = norm;
+    }
+    result.push(tok);
+  }
+  return result.join('');
+}
+
+async function transcribeAll(float32Audio, pipe) {
+  const segments = sliceSegments(float32Audio);
+  let fullText = '';
+  // WebGPUなら内部の30秒窓をバッチ処理して並列化（CPU/wasmではメリットが薄いので1のまま）
+  const batchOpt = state.hasWebGPU ? { batch_size: 4 } : {};
+  const segTimes = [];
+  for (let i = 0; i < segments.length; i++) {
+    const remaining = segments.length - i;
+    let etaText = '';
+    if (segTimes.length > 0) {
+      const avg = segTimes.reduce((a,b) => a+b, 0) / segTimes.length;
+      etaText = `　残り目安: 約${fmtDuration(Math.round(avg * remaining / 1000))}`;
+    }
+    setStage(`文字起こし中… (${i+1}/${segments.length}セグメント)${etaText}`);
+
+    const energy = rmsEnergy(segments[i]);
+    if (energy < SILENCE_RMS_THRESHOLD) {
+      log(`文字起こし: セグメント ${i+1}/${segments.length}（無音のためスキップ）`);
+      segTimes.push(0);
+      setProgress(0.1 + 0.5 * ((i+1) / segments.length));
+      continue;
+    }
+
+    log(`文字起こし: セグメント ${i+1}/${segments.length}`);
+    const t0 = performance.now();
+    const result = await pipe(segments[i], {
+      chunk_length_s: 30,
+      stride_length_s: 5,
+      language: 'japanese',
+      task: 'transcribe',
+      condition_on_previous_text: false, // 前のチャンクの誤りを引きずって暴走するのを防ぐ
+      no_repeat_ngram_size: 3,
+      ...batchOpt,
+    });
+    segTimes.push(performance.now() - t0);
+    const cleaned = collapseRepetition((result.text || '').trim());
+    fullText += cleaned + '\n';
+    setProgress(0.1 + 0.5 * ((i+1) / segments.length)); // 全体の10%〜60%を文字起こしに割当て
+  }
+  return fullText.trim();
+}
+
+
+
+// ---------- Gemini Nano 呼び出し ----------
+async function createNanoSession(systemPrompt, signal) {
+  const extra = signal ? { signal } : {};
+  try {
+    return await LanguageModel.create({
+      initialPrompts: [{ role: 'system', content: systemPrompt }],
+      expectedInputs: [{ type: 'text', languages: ['ja'] }],
+      expectedOutputs: [{ type: 'text', languages: ['ja'] }],
+      ...extra,
+    });
+  } catch (e) {
+    return await LanguageModel.create({ systemPrompt, ...extra });
+  }
+}
+
+// Gemini Nano自体のモデル(数GB)が未ダウンロードだと、最初のcreate()呼び出しが
+// 無言のまま長時間かかる。ここで先にダウンロードだけ済ませ、進捗を可視化する。
+async function ensureNanoReady() {
+  let avail;
+  try {
+    avail = await LanguageModel.availability();
+  } catch (e) {
+    avail = 'unavailable';
+  }
+  if (avail === 'unavailable') return false;
+  if (avail === 'available') return true;
+
+  setStage('Gemini Nanoモデルをダウンロード中(初回のみ・数GB)…');
+  log('Gemini Nanoのモデルダウンロードを開始します。初回のみで、他のツールでも共有されます。数分〜数十分かかる場合があります。');
+  els.skipRow.style.display = 'flex';
+  const controller = new AbortController();
+  state.currentAbort = controller;
+  let lastLogged = -1;
+  try {
+    const session = await LanguageModel.create({
+      signal: controller.signal,
+      monitor(m) {
+        m.addEventListener('downloadprogress', (e) => {
+          const pct = Math.round((e.loaded || 0) * 100);
+          setStage(`Gemini Nanoモデルをダウンロード中… ${pct}%`);
+          if (pct - lastLogged >= 10 || pct === 100) {
+            log(`Nanoモデルダウンロード: ${pct}%`);
+            lastLogged = pct;
+          }
+        });
+      },
+    });
+    session.destroy();
+    log('Gemini Nanoモデルの準備が完了しました', 'ok2');
+    return true;
+  } catch (e) {
+    log(`Gemini Nanoの準備に失敗しました: ${e.message || e}`, 'err');
+    return false;
+  } finally {
+    state.currentAbort = null;
+  }
+}
+
+const EXTRACT_SYSTEM = 'あなたは日本語の会議音声の文字起こしから、議事録作成に必要な情報を抽出するアシスタントです。与えられた文字起こしの一部を読み、話題ごとの要点・決定事項・TODO(担当者や期限が分かれば含める)を簡潔な箇条書きで抽出してください。雑談や文字起こしの誤りと思われる意味不明な箇所は無視してください。出力は箇条書きのみとし、前置きや説明は書かないでください。';
+
+const COMPOSE_SYSTEM = `あなたは日本語の議事録作成アシスタントです。渡されるメモを統合し、次の形式だけで出力してください。前置き・締めの言葉・指定形式以外の説明は書かないでください。
+
+◆ 話題名
+　要点を1〜3行で（各行の先頭に全角スペースを1つ入れる）
+【決定】決定事項の内容（ある場合のみ）
+☐ TODOの内容（担当者が分かれば末尾に「（担当者）」を付記）
+
+話題ごとに◆で区切り、重複する内容はまとめてください。すべての話題を書いたあと、最後に一度だけ全TODOをまとめて次の形式で再掲してください（TODOが一つも無ければこのセクションごと省略）。
+
+▼ 次回までのTODO
+☐ 内容　（担当者）
+
+メモに無い情報を創作しないでください。`;
+
+async function extractNotes(transcript) {
+  const chunks = [];
+  for (let i = 0; i < transcript.length; i += NOTE_CHUNK_CHARS) {
+    chunks.push(transcript.slice(i, i + NOTE_CHUNK_CHARS));
+  }
+  const notes = [];
+  els.skipRow.style.display = 'flex';
+  for (let i = 0; i < chunks.length; i++) {
+    if (state.skipRequested) { log('要点抽出を中断しました'); break; }
+    setStage(`議事録整形中(要点抽出) … (${i+1}/${chunks.length})`);
+    log(`Nano要点抽出: ${i+1}/${chunks.length}`);
+    const controller = new AbortController();
+    state.currentAbort = controller;
+    const session = await createNanoSession(EXTRACT_SYSTEM, controller.signal);
+    try {
+      const res = await session.prompt(`【文字起こし ${i+1}/${chunks.length}(前後が途切れている場合があります)】\n${chunks[i]}`);
+      notes.push(res.trim());
+    } catch (e) {
+      log(`要点抽出でエラー: ${e.message || e}`, 'err');
+    } finally {
+      session.destroy();
+      state.currentAbort = null;
+    }
+    setProgress(0.6 + 0.25 * ((i+1) / chunks.length)); // 60%〜85%
+  }
+  return notes.join('\n');
+}
+
+async function composeMinutes(notesText, meta) {
+  setStage('議事録整形中(仕上げ) …');
+  log('Nano最終整形を実行中');
+  const controller = new AbortController();
+  state.currentAbort = controller;
+  const session = await createNanoSession(COMPOSE_SYSTEM, controller.signal);
+  let result;
+  try {
+    result = await session.prompt(notesText);
+  } finally {
+    state.currentAbort = null;
+    session.destroy();
+  }
+  setProgress(0.95);
+  return buildHeader(meta) + result.trim();
+}
+
+// =========================================================
+// オンライン高速モード：Gemini API（要APIキー・要ネット接続）
+// 音声/動画ファイルをそのままGeminiに渡し、書き起こし＋議事録整形を1回のリクエストで行う
+// =========================================================
+
+const GEMINI_INLINE_LIMIT = 15 * 1024 * 1024; // 15MB以下はinlineData、それ以上はFiles API
+
+const ONLINE_SYSTEM = `あなたは日本語の会議の音声/動画から議事録を作成するアシスタントです。添付された音声を聞いて内容を書き起こし、次の2つのセクションだけで出力してください。他の文章は一切含めないでください。
+
+===TRANSCRIPT===
+（音声の書き起こし全文。話者や言い淀みは適宜整えてよいが、内容を創作しないこと）
+
+===MINUTES===
+◆ 話題名
+　要点を1〜3行で（各行の先頭に全角スペースを1つ入れる）
+【決定】決定事項の内容（ある場合のみ）
+☐ TODOの内容（担当者が分かれば末尾に「（担当者）」を付記）
+（話題ごとに◆で区切り、重複する内容はまとめる。雑談や意味不明な発言は無視する。すべての話題を書いたあと、最後に一度だけ全TODOをまとめて次の形式で再掲する。TODOが一つも無ければこのセクションごと省略）
+
+▼ 次回までのTODO
+☐ 内容　（担当者）`;
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = () => reject(new Error('ファイルの読み込みに失敗しました'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function geminiUploadFile(file, apiKey) {
+  const startRes = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: {
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(file.size),
+      'X-Goog-Upload-Header-Content-Type': file.type || 'application/octet-stream',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ file: { display_name: file.name } }),
+  });
+  if (!startRes.ok) throw new Error(`Geminiへのアップロード開始に失敗しました (HTTP ${startRes.status})`);
+  const uploadUrl = startRes.headers.get('X-Goog-Upload-URL');
+  if (!uploadUrl) throw new Error('アップロードURLが取得できませんでした');
+
+  log('ファイルをGeminiにアップロード中…');
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'X-Goog-Upload-Command': 'upload, finalize',
+      'X-Goog-Upload-Offset': '0',
+    },
+    body: file,
+  });
+  if (!uploadRes.ok) throw new Error(`アップロードに失敗しました (HTTP ${uploadRes.status})`);
+  let info = (await uploadRes.json()).file;
+
+  let tries = 0;
+  while (info && info.state === 'PROCESSING' && tries < 60) {
+    await new Promise(r => setTimeout(r, 2000));
+    const checkRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/${info.name}?key=${encodeURIComponent(apiKey)}`);
+    const body = await checkRes.json();
+    info = body.file || body;
+    tries++;
+  }
+  if (!info || info.state !== 'ACTIVE') throw new Error('Gemini側でのファイル処理がタイムアウトしました');
+  return info;
+}
+
+async function geminiGenerateContent(apiKey, model, parts) {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: ONLINE_SYSTEM }] },
+      contents: [{ role: 'user', parts }],
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data && data.error && data.error.message) ? data.error.message : `HTTPエラー ${res.status}`;
+    throw new Error(msg);
+  }
+  const cand = data && data.candidates && data.candidates[0];
+  const text = cand && cand.content && cand.content.parts
+    ? cand.content.parts.map(p => p.text || '').join('')
+    : '';
+  if (!text) throw new Error('Gemini APIから空の応答が返されました（音声が長すぎる、または内容を認識できなかった可能性があります）');
+  return text;
+}
+
+function splitOnlineResult(text) {
+  const tIdx = text.indexOf('===TRANSCRIPT===');
+  const mIdx = text.indexOf('===MINUTES===');
+  if (tIdx === -1 || mIdx === -1) return { transcript: '', minutes: text };
+  return {
+    transcript: text.slice(tIdx + '===TRANSCRIPT==='.length, mIdx).trim(),
+    minutes: text.slice(mIdx + '===MINUTES==='.length).trim(),
+  };
+}
+
+async function extractAudioOnlyForUpload(file) {
+  const ffmpeg = await getFFmpeg();
+  const inputName = safeFsName(file.name);
+  await ffmpeg.writeFile(inputName, await fetchFileUtil(file));
+  setStage('音声トラックを抽出中…（動画から音声だけを取り出してアップロードを軽くします）');
+  log('動画から音声のみを抽出中…');
+  const outName = 'audio_out.mp3';
+  await ffmpeg.exec(['-i', inputName, '-vn', '-ac', '1', '-ar', '16000', '-acodec', 'libmp3lame', '-b:a', '64k', outName]);
+  const data = await ffmpeg.readFile(outName);
+  ffmpeg.deleteFile(inputName).catch(() => {});
+  ffmpeg.deleteFile(outName).catch(() => {});
+  const blob = new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)], { type: 'audio/mp3' });
+  log(`音声抽出完了（${(blob.size / 1024 / 1024).toFixed(1)}MB、元は${(file.size / 1024 / 1024).toFixed(1)}MB）`, 'ok2');
+  return blob;
+}
+
+async function runOnlineMode(file, meta) {
+  const apiKey = els.geminiKey.value.trim();
+  const model = els.geminiModel.value.trim() || 'gemini-3.5-flash';
+  if (!apiKey) throw new Error('Gemini APIキーを入力してください');
+  saveGeminiKey(apiKey);
+
+  // 動画ファイルは音声トラックだけ抽出してから送る（丸ごと送ると
+  // 「Request contains an invalid argument」等で失敗しやすく、映像分のトークンも無駄になるため）
+  let uploadFile = file;
+  let mime = file.type || 'audio/mp3';
+  if (file.type && file.type.startsWith('video/')) {
+    uploadFile = await extractAudioOnlyForUpload(file);
+    mime = 'audio/mp3';
+  }
+
+  let part;
+  if (uploadFile.size <= GEMINI_INLINE_LIMIT) {
+    setStage('音声データを準備中…');
+    const base64 = await fileToBase64(uploadFile);
+    part = { inlineData: { mimeType: mime, data: base64 } };
+  } else {
+    setStage('Geminiにファイルをアップロード中…（サイズが大きいため時間がかかる場合があります）');
+    log(`ファイルサイズ ${(uploadFile.size / 1024 / 1024).toFixed(1)}MB のためFiles API経由でアップロードします`);
+    const info = await geminiUploadFile(uploadFile, apiKey);
+    part = { fileData: { fileUri: info.uri, mimeType: info.mimeType || mime } };
+  }
+  setProgress(0.4);
+  setStage(`Gemini(${model})が音声を解析中…（数十秒〜数分かかります）`);
+  log(`Geminiに議事録作成をリクエスト中…（モデル: ${model}）`);
+
+  const raw = await geminiGenerateContent(apiKey, model, [
+    { text: '添付の音声/動画は会議の録音です。指示された形式で書き起こしと議事録を作成してください。' },
+    part,
+  ]);
+  setProgress(0.9);
+  log('Geminiからの応答を受信しました', 'ok2');
+
+  const { transcript, minutes } = splitOnlineResult(raw);
+  return {
+    transcript: transcript || '(取得できませんでした)',
+    minutes: buildHeader(meta) + (minutes || raw).trim(),
+  };
+}
+
+// ---------- 結果の描画 ----------
+function renderMinutes(rawText) {
+  const lines = rawText.split('\n');
+  let html = '';
+  for (let raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('# ')) {
+      html += `<div class="doc-title">${escapeHtml(line.replace(/^#\s*/, ''))}</div>`;
+    } else if (/^日時[：:]/.test(line) || /^参加者[：:]/.test(line)) {
+      html += `<div class="meta-line">${escapeHtml(line)}</div>`;
+    } else if (line.startsWith('『') || line.startsWith('▼')) {
+      html += `<div class="section-label">${escapeHtml(line)}</div>`;
+    } else if (line.startsWith('・')) {
+      html += `<p class="bullet">${escapeHtml(line)}</p>`;
+    } else if (line.startsWith('◆')) {
+      html += `<div class="topic">${escapeHtml(line)}</div>`;
+    } else if (line.startsWith('【決定】') || line.startsWith('決定事項')) {
+      const content = line.replace(/^【決定】/, '').replace(/^決定事項[：:]?/, '').trim();
+      html += `<p class="decision">【決定】${escapeHtml(content)}</p>`;
+    } else if (line.startsWith('☐') || /^TODO[：:]?/i.test(line)) {
+      const content = line.replace(/^☐/, '').replace(/^TODO[：:]?/i, '').trim();
+      html += `<p class="todo">☐ ${escapeHtml(content)}</p>`;
+    } else if (line.startsWith('【継続】')) {
+      html += `<p class="ongoing">${escapeHtml(line)}</p>`;
+    } else {
+      html += `<p>${escapeHtml(line)}</p>`;
+    }
+  }
+  els.resultBody.innerHTML = html || '<p>(内容がありませんでした)</p>';
+}
+
+function renderFallback(transcript) {
+  els.resultBody.innerHTML = `<div class="topic">文字起こし結果（自動整形なし）</div>` +
+    transcript.split('\n').filter(l => l.trim()).map(l => `<p>${escapeHtml(l.trim())}</p>`).join('');
+}
+
+// ---------- コピー・ダウンロード ----------
+els.copyBtn.addEventListener('click', async () => {
+  const html = els.resultBody.innerHTML;
+  const text = els.resultBody.innerText;
+  try {
+    const item = new ClipboardItem({
+      'text/html': new Blob([html], { type: 'text/html' }),
+      'text/plain': new Blob([text], { type: 'text/plain' }),
+    });
+    await navigator.clipboard.write([item]);
+    log('クリップボードにコピーしました（書式付き）', 'ok2');
+  } catch (e) {
+    await navigator.clipboard.writeText(text);
+    log('クリップボードにコピーしました（プレーンテキスト）', 'ok2');
+  }
+});
+els.downloadBtn.addEventListener('click', () => {
+  const blob = new Blob([els.resultBody.innerText], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '議事録.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// Word保存：HTMLをそのまま .doc として保存する簡易方式（Wordで開くと書式付きで開けます／厳密なdocxではありません）
+els.wordBtn.addEventListener('click', () => {
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    body { font-family: 'Yu Gothic','Meiryo',sans-serif; font-size: 11pt; }
+    .doc-title { font-size: 16pt; font-weight: bold; }
+    .meta-line { color: #666; font-size: 10pt; }
+    .section-label { font-size: 10pt; font-weight: bold; color: #666; margin-top: 12pt; }
+    .bullet { margin-left: 12pt; }
+    .topic { font-size: 12pt; font-weight: bold; margin-top: 14pt; border-bottom: 1pt solid #ccc; padding-bottom: 2pt; }
+    .decision { color: #ff0000; font-weight: bold; }
+    .todo { background: #d9e8fb; padding: 2pt 6pt; }
+    .ongoing { color: #666; font-style: italic; }
+    .comment { border-left: 3pt solid #1d1d1f; padding-left: 8pt; font-style: italic; }
+  </style></head><body>${els.resultBody.innerHTML}</body></html>`;
+  const blob = new Blob(['\ufeff', html], { type: 'application/msword' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '議事録.doc';
+  a.click();
+  URL.revokeObjectURL(url);
+  log('Wordで開けるファイル(.doc)を保存しました');
+});
+
+// PDF保存：ブラウザの印刷機能を利用（印刷ダイアログで「PDFに保存」を選択）
+els.pdfBtn.addEventListener('click', () => {
+  window.print();
+});
+
+// コメント追加：議事録の末尾に自分の所感を書き込める枠を追加
+els.addCommentBtn.addEventListener('click', () => {
+  const p = document.createElement('p');
+  p.className = 'comment';
+  p.textContent = '💬 ';
+  els.resultBody.appendChild(p);
+  els.resultBody.focus();
+  const range = document.createRange();
+  range.selectNodeContents(p);
+  range.collapse(false);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  p.scrollIntoView({ behavior: 'smooth', block: 'center' });
+});
+
+// スキップボタン：Nanoのダウンロード/整形が長すぎる場合の脱出口
+els.skipBtn.addEventListener('click', () => {
+  state.skipRequested = true;
+  els.skipBtn.disabled = true;
+  els.skipBtn.textContent = '中断中…';
+  log('中断をリクエストしました。現在の処理が終わり次第、文字起こし結果のみ表示します。');
+  if (state.currentAbort) state.currentAbort.abort();
+});
+
+// ---------- オフライン処理（Whisper + Gemini Nano） ----------
+async function runOfflineMode(file, meta) {
+  setStage('音声を読み込み中…');
+  log(`ファイル読み込み: ${file.name}`);
+  const { audio, duration } = await decodeToMono16k(file);
+  setProgress(0.1);
+
+  const pipe = await loadWhisperPipeline(state.quality);
+  const transcript = await transcribeAll(audio, pipe);
+  log('文字起こし完了', 'ok2');
+
+  if (!state.hasNano) {
+    log('Gemini Nano未対応のため、整形をスキップします', 'err');
+    return { transcript, minutes: null };
+  }
+  const nanoOk = await ensureNanoReady();
+  if (!nanoOk || state.skipRequested) {
+    log(nanoOk ? '中断されたため文字起こし結果のみ表示します' : 'Gemini Nanoの準備ができなかったため文字起こし結果のみ表示します', 'err');
+    return { transcript, minutes: null };
+  }
+  const notes = await extractNotes(transcript);
+  if (state.skipRequested || !notes.trim()) {
+    return { transcript, minutes: null };
+  }
+  const minutes = await composeMinutes(notes, meta);
+  return { transcript, minutes };
+}
+
+// ---------- メイン処理 ----------
+els.startBtn.addEventListener('click', async () => {
+  if (!state.file) return;
+  els.startBtn.disabled = true;
+  els.progressCard.classList.add('show');
+  els.resultCard.classList.remove('show');
+  els.logBox.innerHTML = '';
+  els.skipRow.style.display = 'none';
+  els.skipBtn.disabled = false;
+  els.skipBtn.textContent = '議事録整形を中断して文字起こし結果だけ表示';
+  state.skipRequested = false;
+  state.currentAbort = null;
+  setProgress(0.02);
+
+  const meta = {
+    title: els.metaTitle.value.trim(),
+    dateText: fmtMetaDate(els.metaDate.value),
+    members: els.metaMembers.value.trim(),
+    fixedAgenda: getFixedAgendaItems(),
+  };
+
+  let transcript = '';
+  try {
+    if (state.mode === 'online') {
+      const result = await runOnlineMode(state.file, meta);
+      transcript = result.transcript;
+      els.rawTranscript.textContent = transcript;
+      renderMinutes(result.minutes);
+    } else {
+      const result = await runOfflineMode(state.file, meta);
+      transcript = result.transcript;
+      els.rawTranscript.textContent = transcript;
+      if (result.minutes) {
+        renderMinutes(result.minutes);
+      } else {
+        renderFallback(transcript);
+      }
+    }
+
+    setProgress(1);
+    setStage(state.skipRequested ? '中断しました（文字起こし結果のみ）' : '完了しました');
+    els.skipRow.style.display = 'none';
+    els.resultCard.classList.add('show');
+    els.resultCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    console.error(e);
+    log(`エラー: ${e.message || e}`, 'err');
+    setStage('エラーが発生しました。ログを確認してください。');
+    if (transcript) {
+      log('文字起こし結果は取得できているため、そのまま表示します');
+      els.rawTranscript.textContent = transcript;
+      renderFallback(transcript);
+      els.resultCard.classList.add('show');
+    }
+  } finally {
+    els.startBtn.disabled = false;
+    state.currentAbort = null;
+  }
+});
+</script>
+</body>
+</html>
