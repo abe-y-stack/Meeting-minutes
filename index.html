@@ -474,106 +474,145 @@ els.resetBtn.addEventListener('click', () => location.reload());
 
 
 // =========================================================
-// ffmpeg.wasm（単一スレッド版）でファイルから音声を抽出する
-// Chromeのdecoded Audioデータ(Web Audio API)はコンテナ/コーデックによって
-// 失敗することがあるため、より対応範囲の広いffmpegで代替する。
-// 単一スレッド版はSharedArrayBuffer不要のため、GitHub Pagesでもそのまま動く。
+// 音声抽出（ブラウザ標準APIのみ・追加ライブラリなし）
+// 1) まずWeb Audio APIのdecodeAudioDataを試す（速い。ほとんどのファイルで成功）
+// 2) 失敗したら、<video>/<audio>で実際に再生してcaptureStreamで
+//    生の音声データを取得するフォールバックに切り替える
+//    （時間はかかるが、ブラウザが再生できるものは基本的に対応できる）
+// ffmpeg.wasmは環境によって初期化が極端に遅い/固まるケースがあったため使用をやめた。
 // =========================================================
-function withTimeout(promise, ms, message) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+
+function encodeWav16(float32Array, sampleRate) {
+  const numSamples = float32Array.length;
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
 }
 
-let ffmpegInstance = null;
-async function getFFmpeg() {
-  if (ffmpegInstance) return ffmpegInstance;
-  log('ffmpeg.wasmを読み込み中…（回線状況により数十秒〜数分かかることがあります）');
-  const startTime = Date.now();
-  const heartbeat = setInterval(() => {
-    const sec = Math.round((Date.now() - startTime) / 1000);
-    setStage(`音声処理エンジン(ffmpeg.wasm)を読み込み中…（${sec}秒経過）`);
-  }, 3000);
-  setStage('音声処理エンジン(ffmpeg.wasm)を読み込み中…（0秒経過）');
+// 実再生キャプチャ方式（decodeAudioDataが失敗した場合のフォールバック）
+async function decodeViaPlayback(file) {
+  const url = URL.createObjectURL(file);
+  const isVideo = (file.type || '').startsWith('video/') || !(file.type || '').startsWith('audio/');
+  const media = document.createElement(isVideo ? 'video' : 'audio');
+  media.src = url;
+  media.muted = true;
+  media.playsInline = true;
+  media.preload = 'auto';
 
   try {
-    const { FFmpeg } = await withTimeout(
-      import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm'),
-      60000, 'ffmpeg本体スクリプトの取得がタイムアウトしました（60秒）。cdn.jsdelivr.netへのアクセスが社内ネットワーク/プロキシでブロックされていないか確認してください。'
-    );
-    log('ffmpeg本体スクリプト取得完了');
-    const { toBlobURL } = await withTimeout(
-      import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm'),
-      60000, 'ffmpegユーティリティの取得がタイムアウトしました（60秒）。'
-    );
+    await new Promise((resolve, reject) => {
+      media.onloadedmetadata = resolve;
+      media.onerror = () => reject(new Error('ファイルを再生できませんでした（対応していない形式の可能性があります）'));
+    });
+    const duration = media.duration;
+    if (!isFinite(duration) || duration <= 0) throw new Error('音声の長さを取得できませんでした');
 
-    const ffmpeg = new FFmpeg();
-    ffmpeg.on('log', ({ message }) => { if (message) log(`[ffmpeg] ${message}`); });
-    const coreBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
-    const ffmpegBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm';
+    const captureFn = media.captureStream || media.mozCaptureStream;
+    if (!captureFn) throw new Error('このブラウザはcaptureStreamに対応していません');
+    const stream = captureFn.call(media);
 
-    const coreURL = await withTimeout(
-      toBlobURL(`${coreBaseURL}/ffmpeg-core.js`, 'text/javascript'),
-      60000, 'ffmpeg-core.js の取得がタイムアウトしました（60秒）。'
-    );
-    log('ffmpeg-core.js 取得完了');
+    // トラックが揃うまで少し待つ
+    for (let i = 0; i < 50 && stream.getAudioTracks().length === 0; i++) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    const audioTracks = stream.getAudioTracks();
+    if (!audioTracks.length) throw new Error('音声トラックが見つかりませんでした');
 
-    const wasmURL = await withTimeout(
-      toBlobURL(`${coreBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      150000, 'ffmpeg-core.wasm（本体・数十MB）の取得がタイムアウトしました（150秒）。回線が遅いか、社内プロキシが大きいファイルのダウンロードをブロック/遮断している可能性があります。'
-    );
-    log('ffmpeg-core.wasm 取得完了（本体・数十MB）');
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    const silentGain = audioCtx.createGain();
+    silentGain.gain.value = 0;
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(audioCtx.destination);
 
-    const classWorkerURL = await withTimeout(
-      toBlobURL(`${ffmpegBaseURL}/worker.js`, 'text/javascript'),
-      60000, 'worker.js の取得がタイムアウトしました（60秒）。'
-    );
-    log('worker.js 取得完了');
+    const chunks = [];
+    processor.onaudioprocess = (e) => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
 
-    log('Wasm本体を初期化中…（低速なCPUだと数分かかる場合があります）');
-    await withTimeout(
-      ffmpeg.load({ coreURL, wasmURL, classWorkerURL }),
-      180000, 'ffmpeg.wasmの初期化がタイムアウトしました（3分）。'
-    );
-    clearInterval(heartbeat);
-    log('ffmpeg.wasmの読み込み完了', 'ok2');
-    ffmpegInstance = ffmpeg;
-    return ffmpeg;
-  } catch (e) {
-    clearInterval(heartbeat);
-    throw new Error('ffmpeg.wasmの読み込みに失敗しました: ' + (e.message || e));
+    log(`実再生キャプチャ方式に切替（録音の実時間・約${fmtDuration(duration)}かかります）`);
+    let lastLogged = -1;
+    await new Promise((resolve, reject) => {
+      const timer = setInterval(() => {
+        const pct = Math.min(100, Math.round((media.currentTime / duration) * 100));
+        setStage(`音声を抽出中（実再生方式）… ${pct}%`);
+        if (pct - lastLogged >= 20) { log(`音声抽出中… ${pct}%`); lastLogged = pct; }
+      }, 1000);
+      media.onended = () => { clearInterval(timer); resolve(); };
+      media.onerror = () => { clearInterval(timer); reject(new Error('再生中にエラーが発生しました')); };
+      media.play().catch(reject);
+    });
+
+    processor.disconnect();
+    source.disconnect();
+    silentGain.disconnect();
+    const srcRate = audioCtx.sampleRate;
+    await audioCtx.close();
+
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+
+    const offlineCtx = new OfflineAudioContext(1, Math.max(1, Math.ceil(merged.length * SAMPLE_RATE / srcRate)), SAMPLE_RATE);
+    const buf = offlineCtx.createBuffer(1, merged.length, srcRate);
+    buf.copyToChannel(merged, 0);
+    const bs = offlineCtx.createBufferSource();
+    bs.buffer = buf;
+    bs.connect(offlineCtx.destination);
+    bs.start(0);
+    const rendered = await offlineCtx.startRendering();
+    return { audio: rendered.getChannelData(0).slice(), duration };
+  } finally {
+    URL.revokeObjectURL(url);
   }
 }
-async function fetchFileUtil(file) {
-  const { fetchFile } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm');
-  return fetchFile(file);
-}
-function safeFsName(name) {
-  return 'in_' + name.replace(/[^a-zA-Z0-9._-]/g, '_');
-}
 
-// ---------- 音声デコード＆16kHzモノラル化（ffmpeg.wasm経由・オフライン用） ----------
+// ---------- 音声デコード＆16kHzモノラル化（オフライン用） ----------
 async function decodeToMono16k(file) {
-  const ffmpeg = await getFFmpeg();
-  const inputName = safeFsName(file.name);
-  await ffmpeg.writeFile(inputName, await fetchFileUtil(file));
-  setStage('音声を抽出・変換中…');
-  log('音声トラックを16kHzモノラルPCMに変換中…');
   try {
-    await ffmpeg.exec(['-i', inputName, '-vn', '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 'f32le', '-acodec', 'pcm_f32le', 'out.pcm']);
+    const arrayBuffer = await file.arrayBuffer();
+    const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let audioBuffer;
+    try {
+      audioBuffer = await tmpCtx.decodeAudioData(arrayBuffer.slice(0));
+    } finally {
+      tmpCtx.close();
+    }
+    const duration = audioBuffer.duration;
+    const offlineCtx = new OfflineAudioContext(1, Math.ceil(duration * SAMPLE_RATE), SAMPLE_RATE);
+    const src = offlineCtx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(offlineCtx.destination);
+    src.start(0);
+    const rendered = await offlineCtx.startRendering();
+    log('音声デコード完了（標準方式）', 'ok2');
+    return { audio: rendered.getChannelData(0).slice(), duration };
   } catch (e) {
-    throw new Error('音声の抽出に失敗しました（ファイル形式が非対応の可能性があります）: ' + (e.message || e));
+    log(`標準デコードに失敗（${e.message || e}）`, 'err');
+    return await decodeViaPlayback(file);
   }
-  const bytes = await ffmpeg.readFile('out.pcm');
-  const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-  const audio = new Float32Array(buf);
-  ffmpeg.deleteFile(inputName).catch(() => {});
-  ffmpeg.deleteFile('out.pcm').catch(() => {});
-  const duration = audio.length / SAMPLE_RATE;
-  log(`音声抽出完了（長さ: ${fmtDuration(duration)}）`, 'ok2');
-  return { audio, duration };
 }
 
 // ---------- 音声をセグメントに分割 ----------
@@ -908,17 +947,10 @@ function splitOnlineResult(text) {
 }
 
 async function extractAudioOnlyForUpload(file) {
-  const ffmpeg = await getFFmpeg();
-  const inputName = safeFsName(file.name);
-  await ffmpeg.writeFile(inputName, await fetchFileUtil(file));
   setStage('音声トラックを抽出中…（動画から音声だけを取り出してアップロードを軽くします）');
   log('動画から音声のみを抽出中…');
-  const outName = 'audio_out.mp3';
-  await ffmpeg.exec(['-i', inputName, '-vn', '-ac', '1', '-ar', '16000', '-acodec', 'libmp3lame', '-b:a', '64k', outName]);
-  const data = await ffmpeg.readFile(outName);
-  ffmpeg.deleteFile(inputName).catch(() => {});
-  ffmpeg.deleteFile(outName).catch(() => {});
-  const blob = new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)], { type: 'audio/mp3' });
+  const { audio } = await decodeToMono16k(file);
+  const blob = encodeWav16(audio, SAMPLE_RATE);
   log(`音声抽出完了（${(blob.size / 1024 / 1024).toFixed(1)}MB、元は${(file.size / 1024 / 1024).toFixed(1)}MB）`, 'ok2');
   return blob;
 }
@@ -932,10 +964,10 @@ async function runOnlineMode(file, meta) {
   // 動画ファイルは音声トラックだけ抽出してから送る（丸ごと送ると
   // 「Request contains an invalid argument」等で失敗しやすく、映像分のトークンも無駄になるため）
   let uploadFile = file;
-  let mime = file.type || 'audio/mp3';
+  let mime = file.type || 'audio/wav';
   if (file.type && file.type.startsWith('video/')) {
     uploadFile = await extractAudioOnlyForUpload(file);
-    mime = 'audio/mp3';
+    mime = 'audio/wav';
   }
 
   let part;
