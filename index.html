@@ -510,6 +510,20 @@ function encodeWav16(float32Array, sampleRate) {
 }
 
 // 実再生キャプチャ方式（decodeAudioDataが失敗した場合のフォールバック）
+// AudioWorklet用の処理コード（別ファイル不要、Blob URLとして読み込む）
+const PCM_WORKLET_CODE = `
+class PcmCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input.length && input[0] && input[0].length) {
+      this.port.postMessage(input[0].slice(0));
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-capture', PcmCaptureProcessor);
+`;
+
 async function decodeViaPlayback(file) {
   const url = URL.createObjectURL(file);
   const isVideo = (file.type || '').startsWith('video/') || !(file.type || '').startsWith('audio/');
@@ -539,16 +553,22 @@ async function decodeViaPlayback(file) {
     if (!audioTracks.length) throw new Error('音声トラックが見つかりませんでした');
 
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // ScriptProcessorNode（非推奨・メインスレッドが混むと音声を取りこぼす）ではなく、
+    // 専用オーディオスレッドで動くAudioWorkletでキャプチャする（取りこぼしに強い）
+    const workletBlobUrl = URL.createObjectURL(new Blob([PCM_WORKLET_CODE], { type: 'application/javascript' }));
+    await audioCtx.audioWorklet.addModule(workletBlobUrl);
+    URL.revokeObjectURL(workletBlobUrl);
+
     const source = audioCtx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
-    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    const workletNode = new AudioWorkletNode(audioCtx, 'pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1 });
     const silentGain = audioCtx.createGain();
     silentGain.gain.value = 0;
-    source.connect(processor);
-    processor.connect(silentGain);
+    source.connect(workletNode);
+    workletNode.connect(silentGain);
     silentGain.connect(audioCtx.destination);
 
     const chunks = [];
-    processor.onaudioprocess = (e) => { chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    workletNode.port.onmessage = (e) => { chunks.push(e.data); };
 
     log(`実再生キャプチャ方式に切替（録音の実時間・約${fmtDuration(duration)}かかります）`);
     let lastLogged = -1;
@@ -562,8 +582,11 @@ async function decodeViaPlayback(file) {
       media.onerror = () => { clearInterval(timer); reject(new Error('再生中にエラーが発生しました')); };
       media.play().catch(reject);
     });
+    // Worklet経由のメッセージが届き切るまで少し待つ
+    await new Promise(r => setTimeout(r, 300));
 
-    processor.disconnect();
+    workletNode.port.onmessage = null;
+    workletNode.disconnect();
     source.disconnect();
     silentGain.disconnect();
     const srcRate = audioCtx.sampleRate;
@@ -915,25 +938,37 @@ async function geminiUploadFile(file, apiKey) {
 }
 
 async function geminiGenerateContent(apiKey, model, parts) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: ONLINE_SYSTEM }] },
-      contents: [{ role: 'user', parts }],
-    }),
+  const maxRetries = 3;
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: ONLINE_SYSTEM }] },
+    contents: [{ role: 'user', parts }],
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = (data && data.error && data.error.message) ? data.error.message : `HTTPエラー ${res.status}`;
-    throw new Error(msg);
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = (data && data.error && data.error.message) ? data.error.message : `HTTPエラー ${res.status}`;
+      const retriable = res.status === 429 || res.status === 503 || /high demand|overloaded|unavailable/i.test(msg);
+      if (retriable && attempt < maxRetries) {
+        const waitSec = 10 * Math.pow(2, attempt); // 10s, 20s, 40s
+        log(`Geminiが混雑しています。${waitSec}秒後に再試行します…（${attempt + 1}/${maxRetries}回目）`, 'err');
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+        continue;
+      }
+      throw new Error(msg);
+    }
+    const cand = data && data.candidates && data.candidates[0];
+    const text = cand && cand.content && cand.content.parts
+      ? cand.content.parts.map(p => p.text || '').join('')
+      : '';
+    if (!text) throw new Error('Gemini APIから空の応答が返されました（音声が長すぎる、または内容を認識できなかった可能性があります）');
+    return text;
   }
-  const cand = data && data.candidates && data.candidates[0];
-  const text = cand && cand.content && cand.content.parts
-    ? cand.content.parts.map(p => p.text || '').join('')
-    : '';
-  if (!text) throw new Error('Gemini APIから空の応答が返されました（音声が長すぎる、または内容を認識できなかった可能性があります）');
-  return text;
+  throw new Error('Geminiの混雑が続いているため処理できませんでした。しばらく待ってから再度お試しください。');
 }
 
 function splitOnlineResult(text) {
