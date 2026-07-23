@@ -479,31 +479,71 @@ els.resetBtn.addEventListener('click', () => location.reload());
 // 失敗することがあるため、より対応範囲の広いffmpegで代替する。
 // 単一スレッド版はSharedArrayBuffer不要のため、GitHub Pagesでもそのまま動く。
 // =========================================================
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 let ffmpegInstance = null;
 async function getFFmpeg() {
   if (ffmpegInstance) return ffmpegInstance;
-  setStage('音声処理エンジン(ffmpeg.wasm)を読み込み中…（初回のみ・数十MB）');
-  log('ffmpeg.wasmを読み込み中…');
-  const { FFmpeg } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm');
-  const { toBlobURL } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm');
-  const ffmpeg = new FFmpeg();
-  ffmpeg.on('log', ({ message }) => { /* console.debug('[ffmpeg]', message); */ });
-  const coreBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
-  const ffmpegBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm';
+  log('ffmpeg.wasmを読み込み中…（回線状況により数十秒〜数分かかることがあります）');
+  const startTime = Date.now();
+  const heartbeat = setInterval(() => {
+    const sec = Math.round((Date.now() - startTime) / 1000);
+    setStage(`音声処理エンジン(ffmpeg.wasm)を読み込み中…（${sec}秒経過）`);
+  }, 3000);
+  setStage('音声処理エンジン(ffmpeg.wasm)を読み込み中…（0秒経過）');
+
   try {
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${coreBaseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${coreBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      // Workerスクリプト自体もBlob化しないと、file://で開いた場合など
-      // オリジンが'null'になる環境でWorker生成に失敗する（既知の問題）
-      classWorkerURL: await toBlobURL(`${ffmpegBaseURL}/worker.js`, 'text/javascript'),
-    });
+    const { FFmpeg } = await withTimeout(
+      import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm'),
+      60000, 'ffmpeg本体スクリプトの取得がタイムアウトしました（60秒）。cdn.jsdelivr.netへのアクセスが社内ネットワーク/プロキシでブロックされていないか確認してください。'
+    );
+    log('ffmpeg本体スクリプト取得完了');
+    const { toBlobURL } = await withTimeout(
+      import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm'),
+      60000, 'ffmpegユーティリティの取得がタイムアウトしました（60秒）。'
+    );
+
+    const ffmpeg = new FFmpeg();
+    ffmpeg.on('log', () => {});
+    const coreBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    const ffmpegBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm';
+
+    const coreURL = await withTimeout(
+      toBlobURL(`${coreBaseURL}/ffmpeg-core.js`, 'text/javascript'),
+      60000, 'ffmpeg-core.js の取得がタイムアウトしました（60秒）。'
+    );
+    log('ffmpeg-core.js 取得完了');
+
+    const wasmURL = await withTimeout(
+      toBlobURL(`${coreBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      150000, 'ffmpeg-core.wasm（本体・数十MB）の取得がタイムアウトしました（150秒）。回線が遅いか、社内プロキシが大きいファイルのダウンロードをブロック/遮断している可能性があります。'
+    );
+    log('ffmpeg-core.wasm 取得完了（本体・数十MB）');
+
+    const classWorkerURL = await withTimeout(
+      toBlobURL(`${ffmpegBaseURL}/worker.js`, 'text/javascript'),
+      60000, 'worker.js の取得がタイムアウトしました（60秒）。'
+    );
+    log('worker.js 取得完了');
+
+    await withTimeout(
+      ffmpeg.load({ coreURL, wasmURL, classWorkerURL }),
+      60000, 'ffmpeg.wasmの初期化がタイムアウトしました（60秒）。'
+    );
+    clearInterval(heartbeat);
+    log('ffmpeg.wasmの読み込み完了', 'ok2');
+    ffmpegInstance = ffmpeg;
+    return ffmpeg;
   } catch (e) {
-    throw new Error('ffmpeg.wasmの読み込みに失敗しました。GitHub Pagesなどhttp(s)で配信された状態で開いているか確認してください（ファイルをローカルで直接開くと失敗する場合があります）: ' + (e.message || e));
+    clearInterval(heartbeat);
+    throw new Error('ffmpeg.wasmの読み込みに失敗しました: ' + (e.message || e));
   }
-  log('ffmpeg.wasmの読み込み完了', 'ok2');
-  ffmpegInstance = ffmpeg;
-  return ffmpeg;
 }
 async function fetchFileUtil(file) {
   const { fetchFile } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/+esm');
